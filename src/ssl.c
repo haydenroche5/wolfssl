@@ -3889,6 +3889,53 @@ error:
 
     return NULL;
 }
+
+WOLF_STACK_OF(WOLFSSL_X509)* wolfSSL_X509_STORE_get1_certs(
+    WOLFSSL_X509_STORE_CTX* ctx, WOLFSSL_X509_NAME* name)
+{
+    WOLFSSL_ENTER("wolfSSL_X509_STORE_get1_certs");
+    WOLFSSL_X509_STORE* store;
+    WOLFSSL_STACK* sk;
+    WOLFSSL_STACK* certToFilter;
+    WOLFSSL_X509_NAME* certToFilterName;
+    WOLF_STACK_OF(WOLFSSL_X509)* filteredCerts = NULL;
+    WOLFSSL_X509* filteredCert = NULL;
+
+    if (name == NULL)
+        return NULL;
+
+    store = wolfSSL_X509_STORE_CTX_get0_store(ctx);
+    if (store == NULL)
+        return NULL;
+
+    filteredCerts = wolfSSL_sk_X509_new();
+    if (filteredCerts == NULL)
+        return NULL;
+
+    sk = wolfSSL_CertManagerGetCerts(store->cm);
+    if (sk == NULL) {
+        wolfSSL_sk_X509_free(filteredCerts);
+        return NULL;
+    }
+
+    certToFilter = sk;
+    while (certToFilter) {
+        certToFilterName = wolfSSL_X509_get_subject_name(certToFilter->data.x509);
+        if (certToFilterName != NULL) {
+            if (wolfSSL_X509_NAME_cmp(certToFilterName, name) == 0) {
+                filteredCert = wolfSSL_X509_dup(certToFilter->data.x509);
+                if (filteredCert == NULL)
+                    return NULL;
+                wolfSSL_sk_X509_push(filteredCerts, filteredCert);
+            }
+        }
+        certToFilter = certToFilter->next;
+    }
+
+    wolfSSL_sk_X509_free(sk);
+
+    return filteredCerts;
+}
 #endif /* WOLFSSL_SIGNER_DER_CERT */
 
 /******************************************************************************
@@ -34843,6 +34890,68 @@ void *wolfSSL_OPENSSL_malloc(size_t a)
     return (void *)XMALLOC(a, NULL, DYNAMIC_TYPE_OPENSSL);
 }
 
+int wolfSSL_OPENSSL_hexchar2int(unsigned char c)
+{
+    int ret = -1;
+
+    if ('0' <= c && c <= '9') {
+        ret = c - '0';
+    }
+    else if ('a' <= c && c <= 'f') {
+        ret = c - 'a' + 0x0a;
+    }
+    else if ('A' <= c && c <= 'F') {
+        ret = c - 'A' + 0x0a;
+    }
+
+    return ret;
+}
+
+unsigned char *wolfSSL_OPENSSL_hexstr2buf(const char *str, long *len)
+{
+    unsigned char* targetBuf;
+    int srcDigitHigh = 0;
+    int srcDigitLow = 0;
+    size_t srcLen;
+    size_t srcIdx = 0;
+    long targetIdx = 0;
+
+    srcLen = XSTRLEN(str);
+    targetBuf = (unsigned char*)XMALLOC(srcLen / 2, NULL, DYNAMIC_TYPE_OPENSSL);
+    if (targetBuf == NULL) {
+        return NULL;
+    }
+
+    while (srcIdx < srcLen) {
+        if (str[srcIdx] == ':') {
+            srcIdx++;
+            continue;
+        }
+
+        srcDigitHigh = wolfSSL_OPENSSL_hexchar2int(str[srcIdx++]);
+
+        /* Odd number of digits */
+        if (srcIdx == srcLen) {
+            XFREE(targetBuf, NULL, DYNAMIC_TYPE_OPENSSL);
+            return NULL;
+        }
+
+        srcDigitLow = wolfSSL_OPENSSL_hexchar2int(str[srcIdx++]);
+
+        if (srcDigitHigh < 0 || srcDigitLow < 0) {
+            XFREE(targetBuf, NULL, DYNAMIC_TYPE_OPENSSL);
+            return NULL;
+        }
+
+        targetBuf[targetIdx++] = (unsigned char)((srcDigitHigh << 4) | srcDigitLow);
+    }
+
+    if (len != NULL)
+        *len = targetIdx;
+
+    return targetBuf;
+}
+
 int wolfSSL_OPENSSL_init_ssl(word64 opts, const OPENSSL_INIT_SETTINGS *settings)
 {
     (void)opts;
@@ -46587,18 +46696,7 @@ void wolfSSL_THREADID_set_numeric(void* id, unsigned long val)
 }
 #endif
 
-
 #ifndef NO_WOLFSSL_STUB
-WOLF_STACK_OF(WOLFSSL_X509)* wolfSSL_X509_STORE_get1_certs(
-    WOLFSSL_X509_STORE_CTX* ctx, WOLFSSL_X509_NAME* name)
-{
-    WOLFSSL_ENTER("wolfSSL_X509_STORE_get1_certs");
-    WOLFSSL_STUB("X509_STORE_get1_certs");
-    (void)ctx;
-    (void)name;
-    return NULL;
-}
-
 WOLF_STACK_OF(WOLFSSL_X509_OBJECT)* wolfSSL_X509_STORE_get0_objects(
     WOLFSSL_X509_STORE* store)
 {
@@ -48026,6 +48124,58 @@ int wolfSSL_X509_check_ip_asc(WOLFSSL_X509 *x, const char *ipasc,
     return ret;
 }
 #endif
+
+#if defined(OPENSSL_EXTRA) && defined(WOLFSSL_CERT_GEN)
+int wolfSSL_X509_check_email(WOLFSSL_X509 *x, const char *chk, size_t chkLen,
+                             unsigned int flags)
+{
+    WOLFSSL_X509_NAME *subjName;
+    int emailLen;
+    char *emailBuf;
+
+    (void)flags;
+
+    WOLFSSL_ENTER("wolfSSL_X509_check_email");
+
+    if ((x == NULL) || (chk == NULL)) {
+        WOLFSSL_MSG("Invalid parameter");
+        return WOLFSSL_FAILURE;
+    }
+
+    subjName = wolfSSL_X509_get_subject_name(x);
+    if (subjName == NULL)
+        return WOLFSSL_FAILURE;
+
+    /* Call with NULL buffer to get required length. Add 1 for the NUL. */
+    emailLen = wolfSSL_X509_NAME_get_text_by_NID(subjName, NID_emailAddress,
+                                                 NULL, 0) + 1;
+    if (emailLen < 0)
+        return WOLFSSL_FAILURE;
+
+    emailBuf = (char*)XMALLOC(emailLen, x->heap, DYNAMIC_TYPE_OPENSSL);
+    if (emailBuf == NULL)
+        return WOLFSSL_FAILURE;
+
+    emailLen = wolfSSL_X509_NAME_get_text_by_NID(subjName, NID_emailAddress,
+                                                 emailBuf, emailLen);
+    if (emailLen < 0) {
+        XFREE(emailBuf, x->heap, DYNAMIC_TYPE_OPENSSL);
+        return WOLFSSL_FAILURE;
+    }
+
+    if (chkLen == 0)
+        chkLen = XSTRLEN(chk);
+
+    if (chkLen != (size_t)emailLen
+     || XSTRNCMP(chk, emailBuf, chkLen)) {
+        XFREE(emailBuf, x->heap, DYNAMIC_TYPE_OPENSSL);
+        return WOLFSSL_FAILURE;
+    }
+
+    XFREE(emailBuf, x->heap, DYNAMIC_TYPE_OPENSSL);
+    return WOLFSSL_SUCCESS;
+}
+#endif /* OPENSSL_EXTRA && WOLFSSL_CERT_GEN */
 
 #if defined(OPENSSL_ALL) || defined(WOLFSSL_NGINX) || defined(WOLFSSL_HAPROXY) \
     || defined(OPENSSL_EXTRA) || defined(HAVE_LIGHTY)
